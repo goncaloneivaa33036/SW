@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 #define R_SHUNT 100.0   // Resistência usada para medir corrente (em ohms)
-#define BTN_PIN PD2      // Pino do botão
-#define LED_PIN PB5      // Pino do LED
+#define BTN_PIN PD2      // Pino do botão (D2 no Arduino)
+#define LED_PIN PB5      // Pino do LED (13 no Arduino)
 
 // ---------- UART ----------
 void uart_init(unsigned int baud) {
@@ -50,20 +50,21 @@ uint32_t adc_to_millivolts(uint16_t adc_value) {
     return ((uint32_t)adc_value * 5000UL) / 1023UL;
 }
 
-// ---------- Função principal ----------
+// ---------- Programa principal ----------
 int main(void) {
     uart_init(9600);
     adc_init();
 
     DDRB |= (1 << LED_PIN);   // LED como saída
     DDRD &= ~(1 << BTN_PIN);  // Botão como entrada
-    PORTD |= (1 << BTN_PIN);  // Ativa pull-up interno no botão
+    PORTD |= (1 << BTN_PIN);  // Ativa pull-up interno no botão (ligar botão ao GND)
 
     uint8_t modo = 0; // 0 = tensão, 1 = corrente
     char buffer[64];
     uint8_t last_btn_state = 1; // Começa em 1 (botão não pressionado)
 
-    uart_transmit_string("Modo atual: Tensao");
+    // --- Modo inicial: medir tensão ---
+    uart_transmit_string("Modo inicial: Tensao");
     uart_new_line();
 
     while (1) {
@@ -107,5 +108,6 @@ int main(void) {
         _delay_ms(500);
     }
 }
+
 
                                                                          
