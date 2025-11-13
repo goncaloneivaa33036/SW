@@ -1,101 +1,111 @@
-#include <Arduino.h>        // Inclui cabeçalhos base do Arduino (não é essencial aqui, mas garante compatibilidade)
-#define F_CPU 16000000UL    // Define a frequência do microcontrolador (16 MHz para o Arduino Uno)
-#include <avr/io.h>         // Biblioteca para acesso direto aos registos do AVR
-#include <util/delay.h>     // Biblioteca para a função _delay_ms()
-#include <stdio.h>          // Biblioteca para funções de formatação (snprintf)
-#include <stdint.h>         // Biblioteca para tipos inteiros com tamanho definido
+#include <Arduino.h>
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdio.h>
+#include <stdint.h>
 
-// ---------- UART (Comunicação Serial) ----------
+#define R_SHUNT 100.0   // Resistência usada para medir corrente (em ohms)
+#define BTN_PIN PD2      // Pino do botão
+#define LED_PIN PB5      // Pino do LED
 
-// Inicializa a UART (porta série) com uma taxa de transmissão (baud rate) definida
+// ---------- UART ----------
 void uart_init(unsigned int baud) {
-    // Calcula o valor do divisor (UBRR) com base na frequência do CPU e baud rate
     unsigned int ubrr = (F_CPU / (16UL * baud)) - 1;
-    // Divide o valor calculado pelos registos de 8 bits
-    UBRR0H = (unsigned char)(ubrr >> 8);   // Parte alta do divisor
-    UBRR0L = (unsigned char)ubrr;          // Parte baixa do divisor
-    // Ativa o transmissor UART
+    UBRR0H = (unsigned char)(ubrr >> 8);
+    UBRR0L = (unsigned char)ubrr;
     UCSR0B = (1 << TXEN0);
-    // Configura 8 bits de dados e 1 bit de stop
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
-// Transmite um único carácter pela UART
 void uart_transmit(char data) {
-    // Espera até que o buffer de transmissão esteja vazio
     while (!(UCSR0A & (1 << UDRE0)));
-    // Coloca o carácter no registo de transmissão
     UDR0 = data;
 }
 
-// Transmite uma string (sequência de caracteres) pela UART
 void uart_transmit_string(const char *str) {
-    while (*str) uart_transmit(*str++);  // Envia cada carácter até ao terminador '\0'
+    while (*str) uart_transmit(*str++);
 }
 
-// Envia uma nova linha (carriage return + line feed)
 void uart_new_line() {
-    uart_transmit('\r');  // Retorno de carro
-    uart_transmit('\n');  // Nova linha
+    uart_transmit('\r');
+    uart_transmit('\n');
 }
 
-// ---------- ADC (Conversor Analógico-Digital) ----------
-
-// Inicializa o ADC
+// ---------- ADC ----------
 void adc_init() {
-    ADMUX = (1 << REFS0); // Define AVcc (5V) como referência de tensão
-    // Ativa o ADC e define o prescaler para 128 (16 MHz / 128 = 125 kHz → dentro do intervalo recomendado)
+    ADMUX = (1 << REFS0); // AVcc como referência
     ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
 }
 
-// Lê o valor analógico de um canal (0–7)
 uint16_t adc_read(uint8_t ch) {
-    ch &= 0x07;                   // Garante que o canal é válido (0 a 7)
-    ADMUX = (ADMUX & 0xF8) | ch;  // Seleciona o canal mantendo os bits de referência
-    ADCSRA |= (1 << ADSC);        // Inicia a conversão
-    while (ADCSRA & (1 << ADSC)); // Espera até a conversão terminar
-    return ADC;                   // Retorna o valor de 10 bits (0–1023)
+    ch &= 0x07;
+    ADMUX = (ADMUX & 0xF8) | ch;
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC));
+    return ADC;
 }
 
-// Converte o valor do ADC (0–1023) para milivolts (0–5000 mV)
 uint32_t adc_to_millivolts(uint16_t adc_value) {
-    // Usa 5000 mV como referência. Se quiseres ser mais preciso, podes medir a tensão real do Vcc.
     return ((uint32_t)adc_value * 5000UL) / 1023UL;
 }
 
-// ---------- Programa principal ----------
+// ---------- Função principal ----------
 int main(void) {
-    uart_init(9600);  // Inicializa a UART a 9600 bps
-    adc_init();       // Inicializa o ADC
+    uart_init(9600);
+    adc_init();
 
-    DDRB |= (1 << PB5); // Define o pino PB5 (LED do Arduino Uno) como saída
+    DDRB |= (1 << LED_PIN);   // LED como saída
+    DDRD &= ~(1 << BTN_PIN);  // Botão como entrada
+    PORTD |= (1 << BTN_PIN);  // Ativa pull-up interno no botão
 
-    char buffer[64];   // Buffer para armazenar texto antes de enviar pela UART
+    uint8_t modo = 0; // 0 = tensão, 1 = corrente
+    char buffer[64];
+    uint8_t last_btn_state = 1; // Começa em 1 (botão não pressionado)
+
+    uart_transmit_string("Modo atual: Tensao");
+    uart_new_line();
 
     while (1) {
-        // Lê o valor analógico do pino A0 (canal 0)
-        uint16_t value = adc_read(0);
+        // Leitura do botão (detetar transição)
+        uint8_t btn_state = (PIND & (1 << BTN_PIN)) ? 1 : 0;
+        if (last_btn_state == 1 && btn_state == 0) { // botão pressionado
+            modo = !modo; // alterna entre tensão e corrente
+            if (modo == 0)
+                uart_transmit_string("Modo alterado para: Tensao");
+            else
+                uart_transmit_string("Modo alterado para: Corrente");
+            uart_new_line();
+            _delay_ms(200); // debounce simples
+        }
+        last_btn_state = btn_state;
 
-        // Converte o valor lido para milivolts
-        uint32_t mv = adc_to_millivolts(value);
+        // Lê o valor do ADC (A0)
+        uint16_t adc_value = adc_read(0);
+        uint32_t mv = adc_to_millivolts(adc_value);
 
-        // Divide a tensão em parte inteira (volts) e duas casas decimais (centésimos)
-        uint16_t volts = mv / 1000;        // Parte inteira (ex: 2)
-        uint16_t centi = (mv % 1000) / 10; // Parte decimal com 2 dígitos (ex: 47 -> 0.47V)
-
-        // Formata o texto a enviar: "ADC: 512 -> 2.50 V"
-        snprintf(buffer, sizeof(buffer), "ADC: %u -> %u.%02u V", value, volts, centi);
-        uart_transmit_string(buffer);  // Envia a mensagem pela UART
-        uart_new_line();               // Nova linha para legibilidade
-
-        // Se a tensão for maior que 2,5V, acende o LED; caso contrário, apaga
-        if (mv > 2500) {
-            PORTB |= (1 << PB5);   // LED ON
+        if (modo == 0) {
+            // ---- MODO TENSÃO ----
+            uint16_t volts = mv / 1000;
+            uint16_t centi = (mv % 1000) / 10;
+            snprintf(buffer, sizeof(buffer), "ADC: %u -> %u.%02u V", adc_value, volts, centi);
         } else {
-            PORTB &= ~(1 << PB5);  // LED OFF
+            // ---- MODO CORRENTE ----
+            float corrente = (mv / 1000.0) / R_SHUNT; // I = V / R
+            snprintf(buffer, sizeof(buffer), "ADC: %u -> %.2f mA", adc_value, corrente * 1000);
         }
 
-        _delay_ms(500); // Espera 500 ms antes da próxima leitura
+        uart_transmit_string(buffer);
+        uart_new_line();
+
+        // LED ON se valor > metade da escala
+        if (mv > 2500)
+            PORTB |= (1 << LED_PIN);
+        else
+            PORTB &= ~(1 << LED_PIN);
+
+        _delay_ms(500);
     }
 }
+
                                                                          
