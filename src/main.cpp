@@ -1,228 +1,206 @@
-// ================================================================
-//
-//  Funcionalidades incluídas:
-//   - Medição de Tensão (com divisor e referência interna 5V)
-//   - Medição de Corrente usando o sensor ACS712-05B
-//   - Display de 3 dígitos multiplexado (cátodo comum)
-//   - UART para envio de dados ao computador via FTDI/USB
-//   - Botão para alternar entre modos (Tensão ↔ Corrente)
-//   - LED indicador de thresholds
-//
-//  
-// ================================================================
-
-#include <Arduino.h>
 #define F_CPU 16000000UL
 #include <avr/io.h>
 #include <util/delay.h>
-#include <stdio.h>
-#include <stdint.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <avr/interrupt.h>
 
-// ================================================================
-//  CONSTANTES DO SENSOR DE CORRENTE ACS712-05B
-// ================================================================
-#define ACS712_SENSITIVITY 0.185f   // 185 mV/A
-#define ACS712_OFFSET_V    2.5f     // Offset a 0 A
+#define CAL_TENSAO 0.97   // calibração fina com multímetro
 
-// ================================================================
-//  DEFINIÇÃO DE PINOS
-// ================================================================
-#define BTN_PIN PD2      // Botão
-#define LED_PIN PB5      // LED indicador
-#define ADC_CHANNEL 0    // ADC0 (A0)
-
-// ================================================================
-//  DISPLAY 7 SEGMENTOS (CÁTADO COMUM)
-// ================================================================
-// Segmentos a–f → PD2..PD7
-// Segmento g → PB0
-// Ponto decimal → PB1
-// Dígitos → PB2, PB3, PB4
-
-#define SEG_DDR  DDRD
-#define SEG_PORT PORTD
-#define DIG_DDR  DDRB
-#define DIG_PORT PORTB
-#define DIG1 PB2
-#define DIG2 PB3
-#define DIG3 PB4
-#define SEG_G  PB0
-#define SEG_DP PB1
-
-// ================================================================
-//  DIVISOR DE TENSÃO
-//  (Exemplo: 30 V → 5 V)
-// ================================================================
-#define DIVIDER_FACTOR 6.0f   // Ajustar aos valores reais das resistências
-
-// ================================================================
-//  TABELA DE SEGMENTOS (0–9)
-// ================================================================
-const uint8_t seg7[10] = {
-    0x3F, // 0
-    0x06, // 1
-    0x5B, // 2
-    0x4F, // 3
-    0x66, // 4
-    0x6D, // 5
-    0x7D, // 6
-    0x07, // 7
-    0x7F, // 8
-    0x6F  // 9
+/* Tabela 0–9 (cátodo comum) */
+uint8_t digitos_map[10] = {
+    0b00111111, 0b00000110, 0b01011011, 0b01001111, 0b01100110,
+    0b01101101, 0b01111101, 0b00000111, 0b01111111, 0b01101111
 };
 
-// ================================================================
-//  UART
-// ================================================================
-void uart_init(unsigned int baud) {
-    unsigned int ubrr = (F_CPU / (16UL * baud)) - 1;
-    UBRR0H = ubrr >> 8;
-    UBRR0L = ubrr;
-    UCSR0B = (1 << TXEN0);
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+/* Configuração via Serial */
+uint8_t amostras_tensao = 64;
+uint8_t amostras_corrente = 64;
+uint16_t serial_delay_ms = 500;
+
+/* ===== DISPLAY ===== */
+void escreve_segmentos(uint8_t valor, uint8_t dp) {
+    PORTD = (PORTD & 0x03) | ((valor & 0x3F) << 2); 
+    if ((valor >> 6) & 1) PORTC |= (1 << PC2);
+    else PORTC &= ~(1 << PC2);
+
+    if(dp) PORTC |= (1 << PC3);
+    else PORTC &= ~(1 << PC3);
 }
 
-void uart_tx(char c) {
-    while (!(UCSR0A & (1 << UDRE0)));
+void mostra_display(uint8_t bit_pino, uint8_t numero, uint8_t dp) {
+    PORTB &= ~((1<<PB0)|(1<<PB1)|(1<<PB2));
+    escreve_segmentos(digitos_map[numero], dp);
+    PORTB |= (1<<bit_pino);
+    _delay_ms(2);
+}
+
+/* ===== ADC ===== */
+uint16_t adc_leitura(uint8_t canal, uint8_t n_amostras) {
+    uint32_t soma = 0;
+    ADMUX = (ADMUX & 0xF0) | (canal & 0x0F);
+
+    for(uint8_t i=0; i<n_amostras; i++) {
+        ADCSRA |= (1<<ADSC);
+        while (ADCSRA & (1<<ADSC));
+        soma += ADC;
+    }
+    return soma / n_amostras;
+}
+
+/* ===== SERIAL (AJUSTADO PARA 74880) ===== */
+void serial_init(uint32_t baud) {
+    uint16_t ubrr = (F_CPU / 16 / baud) - 1;
+
+    UBRR0H = (ubrr >> 8);
+    UBRR0L = ubrr;
+
+    UCSR0B = (1<<TXEN0)|(1<<RXEN0);
+    UCSR0C = (1<<UCSZ01)|(1<<UCSZ00);
+}
+
+void serial_write(char c) {
+    while (!(UCSR0A & (1<<UDRE0)));
     UDR0 = c;
 }
 
-void uart_print(const char *s) {
-    while (*s) uart_tx(*s++);
+void serial_print(const char* str) {
+    while(*str) serial_write(*str++);
 }
 
-void uart_nl(void) {
-    uart_tx('\r');
-    uart_tx('\n');
+void serial_println(const char* str) {
+    serial_print(str);
+    serial_write('\r');
+    serial_write('\n');
 }
 
-// ================================================================
-//  ADC – SEMPRE A 5 V (AVcc)
-// ================================================================
-void adc_init(void) {
-    ADMUX = (1 << REFS0); // Referência AVcc = 5 V
-    ADCSRA = (1 << ADEN)  // Ativar ADC
-           | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Prescaler 128
+uint8_t serial_available() {
+    return (UCSR0A & (1<<RXC0));
 }
 
-uint16_t adc_read(uint8_t ch) {
-    ADMUX = (ADMUX & 0xF8) | ch;
-    ADCSRA |= (1 << ADSC);
-    while (ADCSRA & (1 << ADSC));
-    return ADC;
+char serial_read() {
+    return UDR0;
 }
 
-// Converter ADC para volts (5 V)
-float adc_to_volts(uint16_t adc) {
-    return (adc * 5.0f) / 1023.0f;
-}
+/* ===== PARSER SERIAL ===== */
+void parse_command(char c) {
+    static char buffer[8];
+    static uint8_t idx = 0;
 
-// ================================================================
-//  FUNÇÕES DO DISPLAY
-// ================================================================
-void digit_on(uint8_t d)  { DIG_PORT |=  (1 << d); }
-void digit_off(uint8_t d) { DIG_PORT &= ~(1 << d); }
+    if (c == '\n' || c == '\r') {
+        buffer[idx] = 0;
 
-void set_segments(uint8_t val, uint8_t dp) {
-    // Preservar RX/TX (PD0, PD1)
-    uint8_t keep = PORTD & 0x03;
-    PORTD = keep | ((seg7[val] & 0x3F) << 2);
+        if (idx >= 2) {
+            char cmd = buffer[0];
+            int val = atoi(&buffer[1]);
 
-    if (seg7[val] & (1 << 6)) DIG_PORT |=  (1 << SEG_G);
-    else                      DIG_PORT &= ~(1 << SEG_G);
+            switch(cmd) {
+                case 't':
+                    amostras_tensao = val;
+                    serial_println("Amostras tensao ajustadas");
+                    break;
 
-    if (dp) DIG_PORT |=  (1 << SEG_DP);
-    else    DIG_PORT &= ~(1 << SEG_DP);
-}
+                case 'c':
+                    amostras_corrente = val;
+                    serial_println("Amostras corrente ajustadas");
+                    break;
 
-void display_number(int value10) {
-    if (value10 < 0) value10 = 0;
-    if (value10 > 999) value10 = 999;
-
-    uint8_t d1 = value10 / 100;
-    uint8_t d2 = (value10 / 10) % 10;
-    uint8_t d3 = value10 % 10;
-
-    for (uint8_t i = 0; i < 5; i++) {
-        digit_off(DIG1); digit_off(DIG2); digit_off(DIG3);
-
-        set_segments(d1, 0);
-        digit_on(DIG1); _delay_ms(2); digit_off(DIG1);
-
-        set_segments(d2, 1);
-        digit_on(DIG2); _delay_ms(2); digit_off(DIG2);
-
-        set_segments(d3, 0);
-        digit_on(DIG3); _delay_ms(2); digit_off(DIG3);
+                case 'f':
+                    serial_delay_ms = val;
+                    serial_println("Frequencia serial ajustada");
+                    break;
+            }
+        }
+        idx = 0;
+    }
+    else {
+        if (idx < sizeof(buffer)-1)
+            buffer[idx++] = c;
     }
 }
 
-// ================================================================
-//  MAIN
-// ================================================================
+/* ===== MAIN ===== */
 int main(void) {
+    DDRD |= 0b11111100;
+    DDRC |= (1<<PC2)|(1<<PC3)|(1<<PC4)|(1<<PC5);
+    DDRB |= (1<<PB0)|(1<<PB1)|(1<<PB2);
+    DDRB &= ~(1<<PB3);
+    PORTB |= (1<<PB3);
 
-    uart_init(9600);
-    adc_init();
-    DDRB |= (1 << LED_PIN);
-        DDRD &= ~(1 << BTN_PIN);
-    PORTD |= (1 << BTN_PIN);
-        SEG_DDR |= 0xFC;
-    DIG_DDR |= (1 << DIG1) | (1 << DIG2) | (1 << DIG3)
-             | (1 << SEG_G) | (1 << SEG_DP);
+    ADMUX  = (1<<REFS0);
+    ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);
+
+    serial_init(74880);
 
     uint8_t modo = 0;
-    uint8_t last_btn = 1;
-    char txt[64];
+    uint8_t btn_last = 1;
+    uint16_t serial_counter = 0;
 
-    uart_print("Modo inicial: Tensao");
-    uart_nl();
-
-    while (1) {
-
-        uint8_t btn = (PIND & (1 << BTN_PIN)) ? 1 : 0;
-        if (last_btn && !btn) {
-            modo = !modo;
-            uart_print(modo ? "Modo: Corrente" : "Modo: Tensao");
-            uart_nl();
+    while(1) {
+        uint8_t btn_now = (PINB & (1<<PB3)) != 0;
+        if (btn_last && !btn_now) {
+            modo ^= 1;
             _delay_ms(200);
         }
-        last_btn = btn;
+        btn_last = btn_now;
 
-        uint16_t adc = adc_read(ADC_CHANNEL);
-        float v_adc = adc_to_volts(adc);
+        float valor_final = 0;
 
-        if (!modo) {
-            // ---------------- TENSÃO ----------------
-            float vin = v_adc * DIVIDER_FACTOR;
-            snprintf(txt, sizeof(txt), "Tensao: %.2f V", vin);
-            uart_print(txt);
-            uart_nl();
-
-            display_number((int)(vin * 10));
-
-            if (vin > 15.0f) PORTB |= (1 << LED_PIN);
-            else             PORTB &= ~(1 << LED_PIN);
-
-        } else {
-            // ---------------- CORRENTE ----------------
-            float corrente = (v_adc - ACS712_OFFSET_V) / ACS712_SENSITIVITY;
-            snprintf(txt, sizeof(txt), "Corrente: %.3f A", corrente);
-            uart_print(txt);
-            uart_nl();
-
-            int mA = (int)(fabs(corrente) * 1000);
-            display_number(mA);
-
-            if (fabs(corrente) > 1.5f) PORTB |= (1 << LED_PIN);
-            else                       PORTB &= ~(1 << LED_PIN);
+        if (modo == 0) {
+            PORTC |= (1<<PC4);
+            PORTC &= ~(1<<PC5);
+            valor_final = adc_leitura(0, amostras_tensao) * 0.0293 * CAL_TENSAO;
+        }
+        else {
+            PORTC |= (1<<PC5);
+            PORTC &= ~(1<<PC4);
+            uint16_t leitura = adc_leitura(1, amostras_corrente);
+            float v = (leitura * 5.0) / 1024.0;
+            valor_final = fabsf((v - 2.5) / 0.185);
+            if (valor_final < 0.05) valor_final = 0;
         }
 
-        _delay_ms(200);
-    }
-    
-    return 0;
-}
+        uint16_t n = (uint16_t)(valor_final * 10 + 0.5);
+        if (n > 999) n = 999;
 
-                                                                     
+        uint8_t d[3] = { n/100, (n/10)%10, n%10 };
+
+        for(uint8_t i=0;i<10;i++) {
+            mostra_display(PB0, d[0], 0);
+            mostra_display(PB1, d[1], 1);
+            mostra_display(PB2, d[2], 0);
+        }
+
+        serial_counter += 10;
+        if (serial_counter >= serial_delay_ms) {
+
+            // ===== DEBUG DO ADC =====
+            uint16_t adc_raw = adc_leitura(0, amostras_tensao);
+            char debug_adc[40];
+            sprintf(debug_adc, "ADC bruto: %u", adc_raw);
+            serial_println(debug_adc);
+
+            // ===== DEBUG DO VALOR CALCULADO =====
+            char debug_val[40];
+            sprintf(debug_val, "Valor calc: %.4f", valor_final);
+            serial_println(debug_val);
+
+            // ===== ENVIO NORMAL =====
+            if (isnan(valor_final) || isinf(valor_final)) {
+                serial_println("Valor invalido");
+            } else {
+                char buf[80];
+                sprintf(buf, "Modo %s: %.2f",
+                        (modo==0?"Tensao":"Corrente"), valor_final);
+                serial_println(buf);
+            }
+
+            serial_counter = 0;
+        }
+
+        while(serial_available()) {
+            parse_command(serial_read());
+        }
+    }
+}
